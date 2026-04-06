@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P File Transfer Client</title>
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .section { border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+        h2 { margin-top: 0; }
+        button { padding: 8px 15px; margin: 5px; cursor: pointer; }
+        input, select { padding: 5px; margin: 5px 0; width: 100%; }
+        .peer-list { max-height: 200px; overflow-y: auto; }
+        .peer-item { padding: 8px; margin: 5px 0; background: #f0f0f0; border-radius: 3px; }
+        .transfer-item { padding: 10px; margin: 5px 0; background: #e8f4f8; border-radius: 3px; }
+        .progress-bar { width: 100%; height: 20px; background: #ddd; border-radius: 3px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #4CAF50; transition: width 0.3s; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 3px; }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .log { max-height: 150px; overflow-y: auto; background: #f5f5f5; padding: 10px; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>P2P File Transfer Test Client</h1>
+    
+    <div class="status" id="connectionStatus">Disconnected</div>
+    
+    <div class="section">
+        <h2>Register as Peer</h2>
+        <input type="text" id="username" placeholder="Username" value="User1">
+        <input type="text" id="ipAddress" placeholder="IP Address" value="192.168.1.100">
+        <input type="number" id="port" placeholder="Port" value="9000">
+        <button onclick="registerPeer()">Register</button>
+        <div id="myPeerInfo"></div>
+    </div>
+    
+    <div class="container">
+        <div class="section">
+            <h2>Online Peers</h2>
+            <button onclick="refreshPeers()">Refresh</button>
+            <div class="peer-list" id="peerList"></div>
+        </div>
+        
+        <div class="section">
+            <h2>Send File</h2>
+            <select id="targetPeer">
+                <option value="">Select peer...</option>
+            </select>
+            <input type="file" id="fileInput">
+            <button onclick="sendFile()">Send File</button>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2>Transfers</h2>
+        <div id="transferList"></div>
+    </div>
+    
+    <div class="section">
+        <h2>Activity Log</h2>
+        <div class="log" id="activityLog"></div>
+    </div>
+
+    <script>
+        let stompClient = null;
+        let myPeerId = null;
+        let socket = null;
+        const API_BASE = 'http://localhost:8083';
+        
+        // Connect to WebSocket
+        function connect() {
+            socket = new SockJS(API_BASE + '/ws');
+            stompClient = Stomp.over(socket);
+            
+            stompClient.connect({}, function(frame) {
+                log('Connected to WebSocket');
+                document.getElementById('connectionStatus').className = 'status connected';
+                document.getElementById('connectionStatus').textContent = 'Connected';
+                
+                // Subscribe to peer updates
+                stompClient.subscribe('/topic/peers', function(message) {
+                    const peers = JSON.parse(message.body);
+                    updatePeerList(peers);
+                });
+            });
+        }
+        
+        // Register peer
+        async function registerPeer() {
+            const username = document.getElementById('username').value;
+            const ipAddress = document.getElementById('ipAddress').value;
+            const port = document.getElementById('port').value;
+            
+            try {
+                const response = await fetch(API_BASE + '/api/peers/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, ipAddress, port: parseInt(port) })
+                });
+                
+                const peer = await response.json();
+                myPeerId = peer.peerId;
+                document.getElementById('myPeerInfo').innerHTML = 
+                    `<strong>Your Peer ID:</strong> ${peer.peerId}`;
+                log('Registered as: ' + username + ' (' + peer.peerId + ')');
+                
+                // Subscribe to personal queues
+                subscribeToPersonalQueues();
+                refreshPeers();
+            } catch (error) {
+                log('Error registering: ' + error.message);
+            }
+        }
+        
+        function subscribeToPersonalQueues() {
+            if (!stompClient || !myPeerId) return;
+            
+            // Transfer requests
+            stompClient.subscribe('/queue/transfer-request-' + myPeerId, function(message) {
+                const transfer = JSON.parse(message.body);
+                log('Incoming transfer: ' + transfer.fileName);
+                handleIncomingTransfer(transfer);
+            });
+            
+            // Transfer accepted
+            stompClient.subscribe('/queue/transfer-accepted-' + myPeerId, function(message) {
+                const transfer = JSON.parse(message.body);
+                log('Transfer accepted: ' + transfer.fileName);
+            });
+            
+            // Transfer rejected
+            stompClient.subscribe('/queue/transfer-rejected-' + myPeerId, function(message) {
+                const transfer = JSON.parse(message.body);
+                log('Transfer rejected: ' + transfer.fileName);
+            });
+        }
+        
+        // Refresh peer list
+        async function refreshPeers() {
+            try {
+                const response = await fetch(API_BASE + '/api/peers/online');
+                const peers = await response.json();
+                updatePeerList(peers);
+            } catch (error) {
+                log('Error fetching peers: ' + error.message);
+            }
+        }
+        
+        function updatePeerList(peers) {
+            const peerList = document.getElementById('peerList');
+            const targetPeer = document.getElementById('targetPeer');
+            
+            peerList.innerHTML = '';
+            targetPeer.innerHTML = '<option value="">Select peer...</option>';
+            
+            peers.forEach(peer => {
+                if (peer.peerId !== myPeerId) {
+                    const div = document.createElement('div');
+                    div.className = 'peer-item';
+                    div.textContent = `${peer.username} (${peer.status})`;
+                    peerList.appendChild(div);
+                    
+                    const option = document.createElement('option');
+                    option.value = peer.peerId;
+                    option.textContent = peer.username;
+                    targetPeer.appendChild(option);
+                }
+            });
+        }
+        
+        // Send file
+        async function sendFile() {
+            const fileInput = document.getElementById('fileInput');
+            const targetPeerId = document.getElementById('targetPeer').value;
+            
+            if (!fileInput.files[0]) {
+                alert('Please select a file');
+                return;
+            }
+            
+            if (!targetPeerId) {
+                alert('Please select a target peer');
+                return;
+            }
+            
+            const file = fileInput.files[0];
+            log('Initiating transfer: ' + file.name);
+            
+            try {
+                // Initiate transfer
+                const response = await fetch(API_BASE + '/api/transfers/initiate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fileName: file.name,
+                        fileSize: file.size,
+                        fileType: file.type,
+                        senderPeerId: myPeerId,
+                        receiverPeerId: targetPeerId
+                    })
+                });
+                
+                const metadata = await response.json();
+                log('Transfer initiated: ' + metadata.fileId);
+                
+                // Subscribe to progress
+                stompClient.subscribe('/topic/transfer-progress-' + metadata.fileId, function(message) {
+                    const progress = JSON.parse(message.body);
+                    updateTransferProgress(metadata.fileId, progress);
+                });
+                
+                // Upload in chunks
+                await uploadFileInChunks(file, metadata.fileId);
+            } catch (error) {
+                log('Error sending file: ' + error.message);
+            }
+        }
+        
+        async function uploadFileInChunks(file, fileId) {
+            const CHUNK_SIZE = 1048576; // 1MB
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            
+            addTransferToList(fileId, file.name, 'Uploading', 0);
+            
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, file.size);
+                const chunk = file.slice(start, end);
+                
+                const formData = new FormData();
+                formData.append('file', chunk);
+                
+                await fetch(
+                    `${API_BASE}/api/transfers/upload-chunk?fileId=${fileId}&chunkNumber=${i}&totalChunks=${totalChunks}`,
+                    { method: 'POST', body: formData }
+                );
+                
+                const progress = Math.round(((i + 1) / totalChunks) * 100);
+                updateTransferProgress(fileId, { progress, status: 'IN_PROGRESS' });
+                log(`Uploaded chunk ${i + 1}/${totalChunks} for ${file.name}`);
+            }
+        }
+        
+        function handleIncomingTransfer(transfer) {
+            if (confirm(`Accept file "${transfer.fileName}" (${formatBytes(transfer.fileSize)})?`)) {
+                acceptTransfer(transfer.fileId);
+            } else {
+                rejectTransfer(transfer.fileId);
+            }
+        }
+        
+        async function acceptTransfer(fileId) {
+            try {
+                await fetch(API_BASE + '/api/transfers/' + fileId + '/accept', { method: 'POST' });
+                log('Transfer accepted: ' + fileId);
+            } catch (error) {
+                log('Error accepting transfer: ' + error.message);
+            }
+        }
+        
+        async function rejectTransfer(fileId) {
+            try {
+                await fetch(API_BASE + '/api/transfers/' + fileId + '/reject', { method: 'POST' });
+                log('Transfer rejected: ' + fileId);
+            } catch (error) {
+                log('Error rejecting transfer: ' + error.message);
+            }
+        }
+        
+        function addTransferToList(fileId, fileName, status, progress) {
+            const transferList = document.getElementById('transferList');
+            const div = document.createElement('div');
+            div.className = 'transfer-item';
+            div.id = 'transfer-' + fileId;
+            div.innerHTML = `
+                <strong>${fileName}</strong><br>
+                Status: <span id="status-${fileId}">${status}</span><br>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progress-${fileId}" style="width: ${progress}%"></div>
+                </div>
+                <span id="progress-text-${fileId}">${progress}%</span>
+            `;
+            transferList.appendChild(div);
+        }
+        
+        function updateTransferProgress(fileId, progress) {
+            const statusEl = document.getElementById('status-' + fileId);
+            const progressEl = document.getElementById('progress-' + fileId);
+            const progressTextEl = document.getElementById('progress-text-' + fileId);
+            
+            if (statusEl) statusEl.textContent = progress.status;
+            if (progressEl) progressEl.style.width = progress.progress + '%';
+            if (progressTextEl) progressTextEl.textContent = progress.progress + '%';
+        }
+        
+        function log(message) {
+            const logDiv = document.getElementById('activityLog');
+            const time = new Date().toLocaleTimeString();
+            logDiv.innerHTML += `[${time}] ${message}<br>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+        
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+        
+        // Connect on load
+        window.onload = function() {
+            connect();
+        };
+    </script>
+</body>
+</html>
